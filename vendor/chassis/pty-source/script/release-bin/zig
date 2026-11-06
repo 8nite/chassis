@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+if [ -z "${CHASSIS_REAL_ZIG:-}" ]; then
+  echo "CHASSIS_REAL_ZIG is required" >&2
+  exit 1
+fi
+
+if [ "${1:-}" = "build" ]; then
+  exec "$CHASSIS_REAL_ZIG" "$@" -Dcpu=baseline
+fi
+
+exec "$CHASSIS_REAL_ZIG" "$@"

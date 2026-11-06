@@ -1,0 +1,1672 @@
+import { Buffer } from "node:buffer"
+import { Effect, Option, Schema, SchemaGetter } from "effect"
+import { Tool } from "@chassis/schema/tool"
+import { Route } from "../route/client.js"
+import { Auth } from "../route/auth.js"
+import { Endpoint } from "../route/endpoint.js"
+import { Framing } from "../route/framing.js"
+import { Protocol } from "../route/protocol.js"
+import { Headers } from "effect/http"
+import { HttpTransport } from "../route/transport/index.js"
+import {
+  AIError,
+  HttpOptions,
+  LLMRequest,
+  LLMEvent,
+  mergeJsonRecords,
+  Usage,
+  type CacheHint,
+  type FinishReasonDetails,
+  type FinishReason,
+  type MediaPart,
+  type ProviderMetadata,
+  type ProviderOptions,
+  type ToolCallPart,
+  type ToolDefinition,
+  type ToolResultPart,
+} from "../schema/index.js"
+import { JsonObject, knownString, optionalArray, optionalNull, ProviderShared } from "./shared.js"
+import { classifyProviderFailure } from "../provider-error.js"
+import { effortUpdate, resolveEffortUpdates } from "../effort-updates.js"
+import * as Cache from "./utils/cache.js"
+import { claudeVersion, supportsThinkingBlockBinding, THINKING_BINDING_BETA } from "./utils/claude-model.js"
+import { Lifecycle } from "./utils/lifecycle.js"
+import { ToolStream } from "./utils/tool-stream.js"
+
+const ADAPTER = "anthropic-messages"
+export const DEFAULT_BASE_URL = "https://api.anthropic.com/v1"
+export const PATH = "/messages"
+export const DEFAULT_MAX_TOKENS = 32_000
+const MIN_THINKING_BUDGET = 1_024
+const DEFAULT_EFFORT = "high"
+
+const SSE_EVENTS = new Set([
+  "message",
+  "message_start",
+  "message_delta",
+  "message_stop",
+  "content_block_start",
+  "content_block_delta",
+  "content_block_stop",
+  "ping",
+  "error",
+])
+export const framing = Framing.sseEvents(SSE_EVENTS)
+
+export type ThinkingBlockBinding = typeof AnthropicThinkingBlockBinding.Type
+export type ThinkingInput = typeof Thinking.Encoded
+
+export type OptionsInput = ProviderOptions & typeof Options.Encoded
+export type ProviderOptionsInput = OptionsInput
+
+export const ContextManagement = Schema.Struct({
+  edits: Schema.Array(
+    Schema.Struct({
+      type: Schema.Literal("compact_20260112"),
+      trigger: Schema.optional(
+        Schema.Struct({
+          type: Schema.Literal("input_tokens"),
+          value: Schema.Int.check(Schema.isGreaterThanOrEqualTo(50000)),
+        }),
+      ),
+      pauseAfterCompaction: Schema.optional(Schema.Boolean),
+      instructions: Schema.optional(Schema.String),
+    }),
+  ),
+})
+export type ContextManagement = typeof ContextManagement.Type
+
+
+
+
+const AnthropicCacheControl = Schema.Struct({
+  type: Schema.tag("ephemeral"),
+  ttl: Schema.optional(Schema.Literals(["5m", "1h"])),
+})
+const AnthropicServiceTier = knownString<"auto" | "standard_only">()
+
+const AnthropicTextBlock = Schema.Struct({
+  type: Schema.tag("text"),
+  text: Schema.String,
+  cache_control: Schema.optional(AnthropicCacheControl),
+})
+type AnthropicTextBlock = Schema.Schema.Type<typeof AnthropicTextBlock>
+
+
+
+const AnthropicBase64ImageSource = Schema.Struct({
+  type: Schema.tag("base64"),
+  media_type: Schema.String,
+  data: Schema.String,
+})
+const AnthropicURLImageSource = Schema.Struct({ type: Schema.tag("url"), url: Schema.String })
+const AnthropicFileImageSource = Schema.Struct({ type: Schema.tag("file"), file_id: Schema.String })
+const AnthropicImageSource = Schema.Union([
+  AnthropicBase64ImageSource,
+  AnthropicURLImageSource,
+  AnthropicFileImageSource,
+])
+const AnthropicImageTransformations = Schema.Struct({
+  oversized_image: Schema.optional(Schema.Literals(["downsize", "error"])),
+})
+
+const AnthropicImageBlock = Schema.Struct({
+  type: Schema.tag("image"),
+  source: AnthropicImageSource,
+  cache_control: Schema.optional(AnthropicCacheControl),
+  transformations: Schema.optional(AnthropicImageTransformations),
+})
+type AnthropicImageBlock = Schema.Schema.Type<typeof AnthropicImageBlock>
+
+
+
+
+const AnthropicBase64PDFSource = Schema.Struct({
+  type: Schema.tag("base64"),
+  media_type: Schema.Literal("application/pdf"),
+  data: Schema.String,
+})
+const AnthropicPlainTextSource = Schema.Struct({
+  type: Schema.tag("text"),
+  media_type: Schema.Literal("text/plain"),
+  data: Schema.String,
+})
+const AnthropicURLPDFSource = Schema.Struct({ type: Schema.tag("url"), url: Schema.String })
+const AnthropicFileDocumentSource = Schema.Struct({ type: Schema.tag("file"), file_id: Schema.String })
+const AnthropicDocumentSource = Schema.Union([
+  AnthropicBase64PDFSource,
+  AnthropicPlainTextSource,
+  AnthropicURLPDFSource,
+  AnthropicFileDocumentSource,
+])
+
+const AnthropicDocumentBlock = Schema.Struct({
+  type: Schema.tag("document"),
+  source: AnthropicDocumentSource,
+  cache_control: Schema.optional(AnthropicCacheControl),
+  title: Schema.optional(Schema.String),
+  context: Schema.optional(Schema.String),
+  citations: Schema.optional(Schema.Struct({ enabled: Schema.Boolean })),
+})
+type AnthropicDocumentBlock = Schema.Schema.Type<typeof AnthropicDocumentBlock>
+
+const AnthropicThinkingBlock = Schema.Struct({
+  type: Schema.tag("thinking"),
+  thinking: Schema.String,
+  signature: Schema.String,
+  cache_control: Schema.optional(AnthropicCacheControl),
+})
+
+
+
+
+const AnthropicRedactedThinkingBlock = Schema.Struct({
+  type: Schema.tag("redacted_thinking"),
+  data: Schema.String,
+  cache_control: Schema.optional(AnthropicCacheControl),
+})
+
+const AnthropicToolUseBlock = Schema.Struct({
+  type: Schema.tag("tool_use"),
+  id: Schema.String,
+  name: Schema.String,
+  input: Schema.Unknown,
+  cache_control: Schema.optional(AnthropicCacheControl),
+})
+type AnthropicToolUseBlock = Schema.Schema.Type<typeof AnthropicToolUseBlock>
+
+const AnthropicServerToolUseBlock = Schema.Struct({
+  type: Schema.tag("server_tool_use"),
+  id: Schema.String,
+  name: Schema.String,
+  input: Schema.Unknown,
+  cache_control: Schema.optional(AnthropicCacheControl),
+})
+type AnthropicServerToolUseBlock = Schema.Schema.Type<typeof AnthropicServerToolUseBlock>
+
+
+
+
+
+
+const AnthropicServerToolResultType = Schema.Literals([
+  "web_search_tool_result",
+  "code_execution_tool_result",
+  "web_fetch_tool_result",
+])
+type AnthropicServerToolResultType = Schema.Schema.Type<typeof AnthropicServerToolResultType>
+
+const AnthropicServerToolResultBlock = Schema.Struct({
+  type: AnthropicServerToolResultType,
+  tool_use_id: Schema.String,
+  content: Schema.Unknown,
+  cache_control: Schema.optional(AnthropicCacheControl),
+})
+type AnthropicServerToolResultBlock = Schema.Schema.Type<typeof AnthropicServerToolResultBlock>
+
+
+
+
+const AnthropicToolResultContent = Schema.Union([AnthropicTextBlock, AnthropicImageBlock, AnthropicDocumentBlock])
+
+const AnthropicToolResultBlock = Schema.Struct({
+  type: Schema.tag("tool_result"),
+  tool_use_id: Schema.String,
+  content: Schema.Union([Schema.String, Schema.Array(AnthropicToolResultContent)]),
+  is_error: Schema.optional(Schema.Boolean),
+  cache_control: Schema.optional(AnthropicCacheControl),
+})
+
+const AnthropicUserBlock = Schema.Union([
+  AnthropicTextBlock,
+  AnthropicImageBlock,
+  AnthropicDocumentBlock,
+  AnthropicToolResultBlock,
+])
+type AnthropicUserBlock = Schema.Schema.Type<typeof AnthropicUserBlock>
+const AnthropicCompactionBlock = Schema.Struct({
+  type: Schema.Literal("compaction"),
+  content: Schema.NullOr(Schema.String),
+})
+const AnthropicAssistantBlock = Schema.Union([
+  AnthropicCompactionBlock,
+  AnthropicTextBlock,
+  AnthropicThinkingBlock,
+  AnthropicRedactedThinkingBlock,
+  AnthropicToolUseBlock,
+  AnthropicServerToolUseBlock,
+  AnthropicServerToolResultBlock,
+])
+type AnthropicAssistantBlock = Schema.Schema.Type<typeof AnthropicAssistantBlock>
+type AnthropicToolResultBlock = Schema.Schema.Type<typeof AnthropicToolResultBlock>
+
+const AnthropicMessage = Schema.Union([
+  Schema.Struct({ role: Schema.Literal("user"), content: Schema.Array(AnthropicUserBlock) }),
+  Schema.Struct({ role: Schema.Literal("assistant"), content: Schema.Array(AnthropicAssistantBlock) }),
+  Schema.Struct({
+    role: Schema.Literal("system"),
+    content: Schema.Array(AnthropicTextBlock),
+    output_config: Schema.optional(Schema.Struct({ effort: Schema.String })),
+  }),
+]).pipe(Schema.toTaggedUnion("role"))
+type AnthropicMessage = Schema.Schema.Type<typeof AnthropicMessage>
+
+const AnthropicTool = Schema.Struct({
+  name: Schema.String,
+  description: Schema.String,
+  input_schema: JsonObject,
+  cache_control: Schema.optional(AnthropicCacheControl),
+})
+type AnthropicTool = Schema.Schema.Type<typeof AnthropicTool>
+
+const AnthropicToolChoice = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literals(["auto", "any", "none"]),
+    disable_parallel_tool_use: Schema.optional(Schema.Boolean),
+  }),
+  Schema.Struct({
+    type: Schema.tag("tool"),
+    name: Schema.String,
+    disable_parallel_tool_use: Schema.optional(Schema.Boolean),
+  }),
+])
+
+const AnthropicThinkingBlockBinding = Schema.Struct({
+  prefix_mismatch_behavior: Schema.optional(knownString<"error" | "drop_block">()),
+})
+
+const AnthropicThinkingFields = {
+  display: Schema.optional(knownString<"summarized" | "omitted">()),
+  block_binding: Schema.optional(AnthropicThinkingBlockBinding),
+}
+const AnthropicThinkingEnabled = Schema.Struct({
+  type: Schema.tag("enabled"),
+  budget_tokens: Schema.Number,
+  ...AnthropicThinkingFields,
+})
+const AnthropicThinkingAdaptive = Schema.Struct({ type: Schema.tag("adaptive"), ...AnthropicThinkingFields })
+const AnthropicThinkingDisabled = Schema.Struct({ type: Schema.Literals(["disabled", "between_tools"]) })
+const AnthropicThinking = Schema.Union([AnthropicThinkingEnabled, AnthropicThinkingAdaptive, AnthropicThinkingDisabled])
+type AnthropicThinking = typeof AnthropicThinking.Type
+
+
+const AnthropicJsonOutputFormat = Schema.Struct({
+  type: Schema.Literal("json_schema"),
+  schema: JsonObject,
+})
+const AnthropicOutputConfig = Schema.Struct({
+  effort: Schema.optional(Schema.String),
+  format: Schema.optional(Schema.NullOr(AnthropicJsonOutputFormat)),
+})
+
+
+const AnthropicMetadata = Schema.Struct({ user_id: optionalNull(Schema.String) })
+
+
+const AnthropicContainer = Schema.Union([
+  Schema.String,
+  Schema.Struct({
+    id: optionalNull(Schema.String),
+    skills: optionalNull(Schema.Array(JsonObject)),
+  }),
+])
+
+
+
+
+
+
+
+
+const ThinkingEnabledInput = Schema.Union([
+  Schema.Struct({ type: Schema.tag("enabled"), budgetTokens: Schema.Number, ...AnthropicThinkingFields }),
+  Schema.Struct({ type: Schema.tag("enabled"), budget_tokens: Schema.Number, ...AnthropicThinkingFields }),
+]).pipe(
+  Schema.decodeTo(AnthropicThinkingEnabled, {
+    decode: SchemaGetter.transform((input) => ({
+      type: "enabled" as const,
+      budget_tokens: "budgetTokens" in input ? input.budgetTokens : input.budget_tokens,
+      display: input.display,
+      block_binding: input.block_binding,
+    })),
+    encode: SchemaGetter.passthrough({ strict: false }),
+  }),
+)
+const Thinking = Schema.Union([ThinkingEnabledInput, AnthropicThinkingAdaptive, AnthropicThinkingDisabled])
+
+const OutputConfigInput = Schema.Struct({
+  effort: optionalNull(Schema.String),
+  format: optionalNull(AnthropicJsonOutputFormat),
+})
+
+
+const Options = Schema.Struct({
+  
+  contextManagement: Schema.optional(ContextManagement),
+  thinking: Schema.optional(Thinking),
+  effort: Schema.optional(Schema.String),
+  service_tier: Schema.optional(AnthropicServiceTier),
+  serviceTier: Schema.optional(AnthropicServiceTier),
+  metadata: Schema.optional(AnthropicMetadata),
+  container: Schema.optional(AnthropicContainer),
+  inference_geo: optionalNull(Schema.String),
+  inferenceGeo: optionalNull(Schema.String),
+  cache_control: Schema.optional(AnthropicCacheControl),
+  cacheControl: Schema.optional(AnthropicCacheControl),
+  output_config: Schema.optional(OutputConfigInput),
+  outputConfig: Schema.optional(OutputConfigInput),
+})
+const decodeOptions = ProviderShared.validateWith(Schema.decodeUnknownEffect(Options))
+
+const AnthropicBodyFields = {
+  context_management: Schema.optional(
+    Schema.Struct({
+      edits: Schema.Array(
+        Schema.Struct({
+          type: Schema.Literal("compact_20260112"),
+          trigger: ContextManagement.fields.edits.value.fields.trigger,
+          pause_after_compaction: Schema.optional(Schema.Boolean),
+          instructions: Schema.optional(Schema.String),
+        }),
+      ),
+    }),
+  ),
+  model: Schema.String,
+  system: optionalArray(AnthropicTextBlock),
+  messages: Schema.Array(AnthropicMessage),
+  tools: optionalArray(AnthropicTool),
+  tool_choice: Schema.optional(AnthropicToolChoice),
+  stream: Schema.Literal(true),
+  max_tokens: Schema.Number,
+  temperature: Schema.optional(Schema.Number),
+  top_p: Schema.optional(Schema.Number),
+  top_k: Schema.optional(Schema.Number),
+  stop_sequences: optionalArray(Schema.String),
+  thinking: Schema.optional(AnthropicThinking),
+  output_config: Schema.optional(AnthropicOutputConfig),
+  
+  cache_control: Schema.optional(AnthropicCacheControl),
+  container: Schema.optional(Schema.NullOr(AnthropicContainer)),
+  inference_geo: Schema.optional(Schema.NullOr(Schema.String)),
+  metadata: Schema.optional(AnthropicMetadata),
+  service_tier: Schema.optional(AnthropicServiceTier),
+}
+export const AnthropicMessagesBody = Schema.Struct(AnthropicBodyFields)
+export type AnthropicMessagesBody = Schema.Schema.Type<typeof AnthropicMessagesBody>
+
+const AnthropicIterationUsage = Schema.StructWithRest(
+  Schema.Struct({
+    input_tokens: optionalNull(Schema.Number),
+    output_tokens: Schema.optional(Schema.Number),
+    cache_creation_input_tokens: optionalNull(Schema.Number),
+    cache_read_input_tokens: optionalNull(Schema.Number),
+    server_tool_use: optionalNull(
+      Schema.StructWithRest(Schema.Struct({ web_search_requests: Schema.optional(Schema.Number) }), [
+        Schema.Record(Schema.String, Schema.Unknown),
+      ]),
+    ),
+    output_tokens_details: optionalNull(
+      Schema.StructWithRest(Schema.Struct({ thinking_tokens: Schema.optional(Schema.Number) }), [
+        Schema.Record(Schema.String, Schema.Unknown),
+      ]),
+    ),
+  }),
+  [Schema.Record(Schema.String, Schema.Unknown)],
+)
+const AnthropicUsage = Schema.StructWithRest(
+  Schema.Struct({
+    ...AnthropicIterationUsage.schema.fields,
+    iterations: Schema.optional(Schema.Array(AnthropicIterationUsage)),
+  }),
+  [JsonObject],
+)
+type AnthropicUsage = Schema.Schema.Type<typeof AnthropicUsage>
+
+const AnthropicStreamBlock = Schema.StructWithRest(
+  Schema.Struct({
+    type: Schema.String,
+    id: Schema.optional(Schema.String),
+    name: Schema.optional(Schema.String),
+    text: Schema.optional(Schema.String),
+    thinking: Schema.optional(Schema.String),
+    signature: Schema.optional(Schema.String),
+    
+    
+    data: Schema.optional(Schema.String),
+    input: Schema.optional(Schema.Unknown),
+    
+    
+    
+    tool_use_id: Schema.optional(Schema.String),
+    content: Schema.optional(Schema.Unknown),
+  }),
+  [JsonObject],
+)
+type AnthropicStreamBlock = Schema.Schema.Type<typeof AnthropicStreamBlock>
+const decodeAnthropicStreamBlock = Schema.decodeUnknownOption(AnthropicStreamBlock)
+
+const AnthropicStreamDelta = Schema.StructWithRest(
+  Schema.Struct({
+    content: optionalNull(Schema.String),
+    type: Schema.optional(Schema.String),
+    text: Schema.optional(Schema.String),
+    thinking: Schema.optional(Schema.String),
+    partial_json: Schema.optional(Schema.String),
+    signature: Schema.optional(Schema.String),
+    stop_reason: optionalNull(Schema.String),
+    stop_sequence: optionalNull(Schema.String),
+    stop_details: optionalNull(
+      Schema.StructWithRest(
+        Schema.Struct({ category: optionalNull(Schema.String), explanation: optionalNull(Schema.String) }),
+        [JsonObject],
+      ),
+    ),
+  }),
+  [JsonObject],
+)
+type AnthropicStreamDelta = Schema.Schema.Type<typeof AnthropicStreamDelta>
+const decodeAnthropicStreamDelta = Schema.decodeUnknownOption(AnthropicStreamDelta)
+
+const AnthropicEvent = Schema.StructWithRest(
+  Schema.Struct({
+    type: Schema.String,
+    index: Schema.optional(Schema.Number),
+    message: Schema.optional(
+      Schema.StructWithRest(Schema.Struct({ usage: Schema.optional(AnthropicUsage) }), [JsonObject]),
+    ),
+    content_block: Schema.optional(Schema.Unknown),
+    delta: Schema.optional(Schema.Unknown),
+    usage: Schema.optional(AnthropicUsage),
+    
+    
+    
+    
+    error: Schema.optional(
+      Schema.StructWithRest(
+        Schema.Struct({ type: Schema.optional(Schema.String), message: Schema.optional(Schema.String) }),
+        [JsonObject],
+      ),
+    ),
+  }),
+  [JsonObject],
+)
+type AnthropicEvent = Schema.Schema.Type<typeof AnthropicEvent>
+
+interface ParserState {
+  readonly provider: LLMRequest["model"]["provider"]
+  readonly compactions: Readonly<Record<number, string | null>>
+  readonly providerMetadataKey: string
+  readonly tools: ToolStream.State<number>
+  readonly reasoningSignatures: Readonly<Record<number, string>>
+  readonly usage?: Usage
+  readonly pendingFinish?: {
+    readonly reason: FinishReasonDetails
+    readonly providerMetadata?: ProviderMetadata
+  }
+  readonly lifecycle: Lifecycle.State
+}
+
+const invalid = ProviderShared.invalidRequest
+
+
+
+
+
+
+
+
+const ANTHROPIC_BREAKPOINT_CAP = 4
+
+const EPHEMERAL_5M = { type: "ephemeral" as const }
+const EPHEMERAL_1H = { type: "ephemeral" as const, ttl: "1h" as const }
+
+const cacheControl = (breakpoints: Cache.Breakpoints, cache: CacheHint | undefined) => {
+  if (cache?.type !== "ephemeral" && cache?.type !== "persistent") return undefined
+  if (breakpoints.remaining <= 0) {
+    breakpoints.dropped += 1
+    return undefined
+  }
+  breakpoints.remaining -= 1
+  return Cache.ttlBucket(cache.ttlSeconds) === "1h" ? EPHEMERAL_1H : EPHEMERAL_5M
+}
+
+const providerMetadata = (key: string, metadata: Record<string, unknown>): ProviderMetadata => ({ [key]: metadata })
+
+const signatureFromMetadata = (metadata: ProviderMetadata | undefined, key: string): string | undefined => {
+  const provider = metadata?.[key]
+  if (!ProviderShared.isRecord(provider)) return undefined
+  return typeof provider.signature === "string" ? provider.signature : undefined
+}
+
+const redactedDataFromMetadata = (metadata: ProviderMetadata | undefined, key: string): string | undefined => {
+  const provider = metadata?.[key]
+  if (!ProviderShared.isRecord(provider)) return undefined
+  return typeof provider.redactedData === "string" ? provider.redactedData : undefined
+}
+
+const lowerTool = (breakpoints: Cache.Breakpoints, tool: ToolDefinition): AnthropicTool => ({
+  name: tool.name,
+  description: tool.description,
+  input_schema: tool.inputSchema,
+  cache_control: cacheControl(breakpoints, tool.cache),
+})
+
+const lowerToolChoice = (toolChoice: NonNullable<LLMRequest["toolChoice"]>) =>
+  ProviderShared.matchToolChoice("Anthropic Messages", toolChoice, {
+    auto: () => ({
+      type: "auto" as const,
+      ...(toolChoice.disableParallelToolUse === undefined
+        ? {}
+        : { disable_parallel_tool_use: toolChoice.disableParallelToolUse }),
+    }),
+    none: () => ({ type: "none" as const }),
+    required: () => ({
+      type: "any" as const,
+      ...(toolChoice.disableParallelToolUse === undefined
+        ? {}
+        : { disable_parallel_tool_use: toolChoice.disableParallelToolUse }),
+    }),
+    tool: (name) => ({
+      type: "tool" as const,
+      name,
+      ...(toolChoice.disableParallelToolUse === undefined
+        ? {}
+        : { disable_parallel_tool_use: toolChoice.disableParallelToolUse }),
+    }),
+  })
+
+const scrubToolCallID = (id: string) => id.replace(/[^a-zA-Z0-9_-]/g, "_")
+
+const lowerToolCall = (part: ToolCallPart): AnthropicToolUseBlock => ({
+  type: "tool_use",
+  id: scrubToolCallID(part.id),
+  name: part.name,
+  input: part.input,
+})
+
+const lowerServerToolCall = (part: ToolCallPart): AnthropicServerToolUseBlock => ({
+  type: "server_tool_use",
+  id: scrubToolCallID(part.id),
+  name: part.name,
+  input: part.input,
+})
+
+
+
+
+const serverToolResultType = (name: string): AnthropicServerToolResultType | undefined => {
+  if (name === "web_search") return "web_search_tool_result"
+  if (name === "code_execution") return "code_execution_tool_result"
+  if (name === "web_fetch") return "web_fetch_tool_result"
+  return undefined
+}
+
+const lowerServerToolResult = Effect.fnUntraced(function* (part: ToolResultPart, providerMetadataKey: string) {
+  const wireType = serverToolResultType(part.name)
+  if (!wireType)
+    return yield* invalid(`Anthropic Messages does not know how to round-trip server tool result for ${part.name}`)
+  
+  
+  const payload = part.providerMetadata?.[providerMetadataKey]?.["result"] ?? part.result.value
+  return {
+    type: wireType,
+    tool_use_id: scrubToolCallID(part.id),
+    content: payload,
+  } satisfies AnthropicServerToolResultBlock
+})
+
+const fileIdFromMetadata = (metadata: MediaPart["metadata"]): string | undefined => {
+  if (!ProviderShared.isRecord(metadata)) return undefined
+  const anthropic = metadata.anthropic
+  if (ProviderShared.isRecord(anthropic)) {
+    if (typeof anthropic.file_id === "string") return anthropic.file_id
+    if (typeof anthropic.fileId === "string") return anthropic.fileId
+  }
+  if (typeof metadata.file_id === "string") return metadata.file_id
+  if (typeof metadata.fileId === "string") return metadata.fileId
+  return undefined
+}
+
+const transformationsFromMetadata = (
+  metadata: MediaPart["metadata"],
+): AnthropicImageBlock["transformations"] | undefined => {
+  if (!ProviderShared.isRecord(metadata)) return undefined
+  const anthropic = ProviderShared.isRecord(metadata.anthropic) ? metadata.anthropic : undefined
+  const raw = anthropic?.transformations ?? metadata.transformations
+  if (ProviderShared.isRecord(raw)) {
+    const value = raw.oversized_image
+    if (value === "downsize" || value === "error") return { oversized_image: value }
+  }
+  if (anthropic && (anthropic.oversized_image === "downsize" || anthropic.oversized_image === "error"))
+    return { oversized_image: anthropic.oversized_image }
+  return undefined
+}
+
+const documentTitleFromPart = (part: MediaPart): string | undefined => {
+  if (ProviderShared.isRecord(part.metadata)) {
+    const anthropic = part.metadata.anthropic
+    if (ProviderShared.isRecord(anthropic) && typeof anthropic.title === "string") return anthropic.title
+    if (typeof part.metadata.title === "string") return part.metadata.title
+  }
+  if (typeof part.filename === "string" && part.filename.length > 0) return part.filename
+  return undefined
+}
+
+const documentContextFromMetadata = (metadata: MediaPart["metadata"]): string | undefined => {
+  if (!ProviderShared.isRecord(metadata)) return undefined
+  const anthropic = ProviderShared.isRecord(metadata.anthropic) ? metadata.anthropic : undefined
+  if (anthropic && typeof anthropic.context === "string") return anthropic.context
+  if (typeof metadata.context === "string") return metadata.context
+  return undefined
+}
+
+const citationsFromMetadata = (metadata: MediaPart["metadata"]): AnthropicDocumentBlock["citations"] | undefined => {
+  if (!ProviderShared.isRecord(metadata)) return undefined
+  const raw = ProviderShared.isRecord(metadata.anthropic)
+    ? (metadata.anthropic.citations ?? metadata.citations)
+    : metadata.citations
+  if (ProviderShared.isRecord(raw) && typeof raw.enabled === "boolean") return { enabled: raw.enabled }
+  return undefined
+}
+
+const isHttpUrl = (value: string) => /^https?:\/\//i.test(value.trim())
+
+const lowerMedia = Effect.fnUntraced(function* (part: MediaPart, breakpoints?: Cache.Breakpoints) {
+  const mime = part.media.mediaType.toLowerCase()
+  const cacheControlValue = breakpoints ? cacheControl(breakpoints, part.cache) : undefined
+  const fileId = fileIdFromMetadata(part.metadata)
+
+  
+  if (fileId) {
+    if (mime.startsWith("image/"))
+      return {
+        type: "image" as const,
+        source: { type: "file" as const, file_id: fileId },
+        ...(cacheControlValue === undefined ? {} : { cache_control: cacheControlValue }),
+        ...(transformationsFromMetadata(part.metadata) === undefined
+          ? {}
+          : { transformations: transformationsFromMetadata(part.metadata)! }),
+      } satisfies AnthropicImageBlock
+    return {
+      type: "document" as const,
+      source: { type: "file" as const, file_id: fileId },
+      ...(cacheControlValue === undefined ? {} : { cache_control: cacheControlValue }),
+      ...(documentTitleFromPart(part) === undefined ? {} : { title: documentTitleFromPart(part)! }),
+      ...(documentContextFromMetadata(part.metadata) === undefined
+        ? {}
+        : { context: documentContextFromMetadata(part.metadata)! }),
+      ...(citationsFromMetadata(part.metadata) === undefined
+        ? {}
+        : { citations: citationsFromMetadata(part.metadata)! }),
+    } satisfies AnthropicDocumentBlock
+  }
+
+  const rawString = ProviderShared.mediaUrl(part.media)?.trim()
+  
+  if (rawString && isHttpUrl(rawString)) {
+    if (mime.startsWith("image/"))
+      return {
+        type: "image" as const,
+        source: { type: "url" as const, url: rawString },
+        ...(cacheControlValue === undefined ? {} : { cache_control: cacheControlValue }),
+        ...(transformationsFromMetadata(part.metadata) === undefined
+          ? {}
+          : { transformations: transformationsFromMetadata(part.metadata)! }),
+      } satisfies AnthropicImageBlock
+    if (mime === "application/pdf")
+      return {
+        type: "document" as const,
+        source: { type: "url" as const, url: rawString },
+        ...(cacheControlValue === undefined ? {} : { cache_control: cacheControlValue }),
+        ...(documentTitleFromPart(part) === undefined ? {} : { title: documentTitleFromPart(part)! }),
+        ...(documentContextFromMetadata(part.metadata) === undefined
+          ? {}
+          : { context: documentContextFromMetadata(part.metadata)! }),
+        ...(citationsFromMetadata(part.metadata) === undefined
+          ? {}
+          : { citations: citationsFromMetadata(part.metadata)! }),
+      } satisfies AnthropicDocumentBlock
+  }
+
+  const media = yield* ProviderShared.requireInlineMedia("Anthropic Messages", part.media)
+
+  
+  if (mime === "text/plain") {
+    const textData = Buffer.from(media.base64, "base64").toString("utf8")
+    return {
+      type: "document" as const,
+      source: { type: "text" as const, media_type: "text/plain" as const, data: textData },
+      ...(cacheControlValue === undefined ? {} : { cache_control: cacheControlValue }),
+      ...(documentTitleFromPart(part) === undefined ? {} : { title: documentTitleFromPart(part)! }),
+      ...(documentContextFromMetadata(part.metadata) === undefined
+        ? {}
+        : { context: documentContextFromMetadata(part.metadata)! }),
+      ...(citationsFromMetadata(part.metadata) === undefined
+        ? {}
+        : { citations: citationsFromMetadata(part.metadata)! }),
+    } satisfies AnthropicDocumentBlock
+  }
+
+  if (media.mime === "application/pdf")
+    return {
+      type: "document" as const,
+      source: {
+        type: "base64" as const,
+        media_type: "application/pdf" as const,
+        data: media.base64,
+      },
+      ...(cacheControlValue === undefined ? {} : { cache_control: cacheControlValue }),
+      ...(documentTitleFromPart(part) === undefined ? {} : { title: documentTitleFromPart(part)! }),
+      ...(documentContextFromMetadata(part.metadata) === undefined
+        ? {}
+        : { context: documentContextFromMetadata(part.metadata)! }),
+      ...(citationsFromMetadata(part.metadata) === undefined
+        ? {}
+        : { citations: citationsFromMetadata(part.metadata)! }),
+    } satisfies AnthropicDocumentBlock
+  if (!media.mime.startsWith("image/"))
+    return yield* invalid(`Anthropic Messages does not support media type ${part.media.mediaType}`)
+  return {
+    type: "image" as const,
+    source: {
+      type: "base64" as const,
+      media_type: media.mime,
+      data: media.base64,
+    },
+    ...(cacheControlValue === undefined ? {} : { cache_control: cacheControlValue }),
+    ...(transformationsFromMetadata(part.metadata) === undefined
+      ? {}
+      : { transformations: transformationsFromMetadata(part.metadata)! }),
+  } satisfies AnthropicImageBlock
+})
+
+
+
+const lowerToolResultContentItem = Effect.fnUntraced(function* (item: Tool.Content) {
+  if (item.type === "text") return { type: "text" as const, text: item.text } satisfies AnthropicTextBlock
+  return yield* lowerMedia(ProviderShared.toolFileMedia(item))
+})
+
+const lowerToolResultContent = Effect.fnUntraced(function* (part: ToolResultPart) {
+  
+  
+  if (part.result.type !== "content") return ProviderShared.toolResultText(part)
+  
+  const content: ReadonlyArray<Tool.Content> = part.result.value
+  return yield* Effect.forEach(content, lowerToolResultContentItem)
+})
+
+const requireThinkingSignature = (request: LLMRequest) => {
+  if (request.model.compatibility?.requireSignature !== undefined) return request.model.compatibility.requireSignature
+  const provider = request.model.provider.toLowerCase()
+  const model = request.model.id.toLowerCase()
+  const baseURL = (request.model.route.endpoint.baseURL ?? "").toLowerCase()
+  if (
+    provider === "kimi-for-coding" ||
+    provider === "moonshotai" ||
+    provider === "moonshotai-cn" ||
+    model.startsWith("kimi-") ||
+    baseURL.includes("api.kimi.com/coding") ||
+    baseURL.includes("api.moonshot.invalid/anthropic") ||
+    baseURL.includes("api.moonshot.cn/anthropic")
+  )
+    return false
+  if (provider.includes("xiaomi") || model.includes("mimo") || baseURL.includes("xiaomimimo.com")) return false
+  return true
+}
+
+
+const supportsNativeSystemUpdates = (request: LLMRequest) => {
+  const version = claudeVersion(String(request.model.id))
+  if (version === undefined) return false
+  if (version.family === "opus" && version.major === 4) return version.minor >= 8
+  return version.major >= 5
+}
+
+
+const acceptsNativeSystemAfter = (message: AnthropicMessage | undefined) =>
+  message?.role === "user" || (message?.role === "assistant" && message.content.at(-1)?.type === "server_tool_use")
+
+const splitsLocalToolResults = (messages: LLMRequest["messages"], index: number) => {
+  const pending = new Set<string>()
+  for (const message of messages.slice(0, index)) {
+    for (const part of message.content) {
+      if (message.role === "assistant" && part.type === "tool-call" && part.providerExecuted !== true)
+        pending.add(part.id)
+      if (message.role === "tool" && part.type === "tool-result") pending.delete(part.id)
+    }
+  }
+  return pending.size > 0
+}
+
+const lowerNativeSystemUpdate = Effect.fnUntraced(function* (
+  message: LLMRequest["messages"][number],
+  breakpoints: Cache.Breakpoints,
+) {
+  const content = yield* ProviderShared.systemUpdateText("Anthropic Messages", message)
+  return {
+    role: "system" as const,
+    content: content.map((part) => ({
+      type: "text" as const,
+      text: part.text,
+      cache_control: cacheControl(breakpoints, part.cache),
+    })),
+  }
+})
+
+const lowerWrappedSystemUpdate = Effect.fnUntraced(function* (
+  message: LLMRequest["messages"][number],
+  breakpoints: Cache.Breakpoints,
+) {
+  const part = yield* ProviderShared.wrappedSystemUpdate("Anthropic Messages", message)
+  return { type: "text" as const, text: part.text, cache_control: cacheControl(breakpoints, part.cache) }
+})
+
+const appendToUserTurn = (messages: AnthropicMessage[], block: AnthropicUserBlock) => {
+  const last = messages.at(-1)
+  if (last?.role === "user") messages[messages.length - 1] = { role: "user", content: [...last.content, block] }
+  else messages.push({ role: "user", content: [block] })
+}
+
+const lowerMessages = Effect.fnUntraced(function* (request: LLMRequest, breakpoints: Cache.Breakpoints) {
+  const messages: AnthropicMessage[] = []
+  const providerMetadataKey = request.model.route.providerMetadataKey ?? String(request.model.provider)
+  
+  
+  const holdUpdates = supportsNativeSystemUpdates(request)
+  const held: Array<LLMRequest["messages"][number]> = []
+  const releaseHeld = Effect.fnUntraced(function* () {
+    const native = acceptsNativeSystemAfter(messages.findLast((message) => message.role !== "system"))
+    for (const update of held.splice(0)) {
+      if (native) messages.push(yield* lowerNativeSystemUpdate(update, breakpoints))
+      else appendToUserTurn(messages, yield* lowerWrappedSystemUpdate(update, breakpoints))
+    }
+  })
+
+  for (const [index, message] of request.messages.entries()) {
+    if (message.role === "system") {
+      const update = effortUpdate(message)
+      if (update) {
+        
+        messages.push({ role: "system", content: [], output_config: { effort: update.effort ?? DEFAULT_EFFORT } })
+        continue
+      }
+      if (splitsLocalToolResults(request.messages, index))
+        return yield* invalid("Anthropic Messages system updates cannot split a local tool call from its tool result")
+      if (holdUpdates) held.push(message)
+      else appendToUserTurn(messages, yield* lowerWrappedSystemUpdate(message, breakpoints))
+      continue
+    }
+
+    if (message.role === "user") {
+      const content: AnthropicUserBlock[] = []
+      for (const part of message.content) {
+        if (part.type === "text") {
+          if (part.text.trim().length === 0) continue
+          content.push({ type: "text", text: part.text, cache_control: cacheControl(breakpoints, part.cache) })
+          continue
+        }
+        if (part.type === "media") {
+          content.push(yield* lowerMedia(part, breakpoints))
+          continue
+        }
+        return yield* ProviderShared.unsupportedContent("Anthropic Messages", "user", ["text", "media"])
+      }
+      if (content.length > 0) messages.push({ role: "user", content })
+      continue
+    }
+
+    if (message.role === "assistant") {
+      const content: AnthropicAssistantBlock[] = []
+      for (const part of message.content) {
+        if (part.type === "compaction") {
+          if (part.provider !== request.model.provider || part.text === undefined)
+            return yield* invalid("Compaction state must be replayed to its originating provider and API")
+          content.push({ type: "compaction", content: part.text })
+          continue
+        }
+        if (part.type === "text") {
+          if (part.text.trim().length === 0) continue
+          content.push({ type: "text", text: part.text, cache_control: cacheControl(breakpoints, part.cache) })
+          continue
+        }
+        if (part.type === "reasoning") {
+          
+          
+          const signature = part.encrypted ?? signatureFromMetadata(part.providerMetadata, providerMetadataKey)
+          const redactedData = redactedDataFromMetadata(part.providerMetadata, providerMetadataKey)
+          if (signature === undefined && redactedData !== undefined) {
+            content.push({ type: "redacted_thinking", data: redactedData })
+            continue
+          }
+          if (typeof signature !== "string" || signature.trim().length === 0) {
+            if (part.text.trim().length === 0) continue
+            if (!requireThinkingSignature(request)) {
+              content.push({ type: "thinking", thinking: part.text, signature: "" })
+              continue
+            }
+            
+            
+            
+            content.push({
+              type: "text",
+              text: part.text,
+              cache_control: cacheControl(breakpoints, part.cache),
+            })
+            continue
+          }
+          content.push({ type: "thinking", thinking: part.text, signature })
+          continue
+        }
+        if (part.type === "tool-call") {
+          content.push(part.providerExecuted ? lowerServerToolCall(part) : lowerToolCall(part))
+          continue
+        }
+        if (part.type === "tool-result" && part.providerExecuted) {
+          content.push(yield* lowerServerToolResult(part, providerMetadataKey))
+          continue
+        }
+        return yield* invalid(
+          `Anthropic Messages assistant messages only support text, reasoning, and tool-call content for now`,
+        )
+      }
+      if (content.length === 0) continue
+      yield* releaseHeld()
+      messages.push({ role: "assistant", content })
+      continue
+    }
+
+    const content: AnthropicToolResultBlock[] = []
+    for (const part of message.content) {
+      if (!ProviderShared.supportsContent(part, ["tool-result"]))
+        return yield* ProviderShared.unsupportedContent("Anthropic Messages", "tool", ["tool-result"])
+      content.push({
+        type: "tool_result",
+        tool_use_id: scrubToolCallID(part.id),
+        content: yield* lowerToolResultContent(part),
+        is_error: part.result.type === "error" ? true : undefined,
+        cache_control: cacheControl(breakpoints, part.cache),
+      })
+    }
+    const previous = messages.at(-1)
+    if (previous?.role === "user" && previous.content.every((block) => block.type === "tool_result"))
+      messages[messages.length - 1] = { role: "user", content: [...previous.content, ...content] }
+    else messages.push({ role: "user", content })
+  }
+  yield* releaseHeld()
+
+  return messages
+})
+
+
+
+
+const isThinkingOff = Schema.is(AnthropicThinkingDisabled)
+
+
+const supportsEffortUpdates = (request: LLMRequest) => {
+  if (isThinkingOff(request.providerOptions?.thinking)) return false
+  const override = request.model.compatibility?.supportsEffortUpdates
+  if (override !== undefined) return override
+  const version = claudeVersion(request.model.id)
+  if (version === undefined) return false
+  if (version.family === "opus" && version.major >= 5) return true
+  return version.major > 5 || (version.major === 5 && version.minor >= 1)
+}
+
+const applyThinkingBindingDefault = (model: LLMRequest["model"], thinking: AnthropicThinking | undefined) => {
+  if (isThinkingOff(thinking)) return thinking
+  if (!supportsThinkingBlockBinding(model)) return thinking
+  return {
+    ...(thinking ?? { type: "adaptive" as const }),
+    block_binding: {
+      prefix_mismatch_behavior: "drop_block",
+      ...thinking?.block_binding,
+    },
+  }
+}
+
+
+const fitThinking = (thinking: AnthropicThinking | undefined, maxTokens: number) =>
+  thinking?.type === "enabled"
+    ? {
+        ...thinking,
+        budget_tokens: ProviderShared.fitThinkingBudget(thinking.budget_tokens, maxTokens, MIN_THINKING_BUDGET),
+      }
+    : thinking
+
+const fromRequest = Effect.fn("AnthropicMessages.fromRequest")(function* (request: LLMRequest) {
+  const options = yield* decodeOptions(request.providerOptions ?? {})
+  const management = options.contextManagement
+  const outputConfig = options.output_config ?? options.outputConfig
+  const format = outputConfig?.format ?? undefined
+  const updates = resolveEffortUpdates(request, options.effort ?? outputConfig?.effort ?? undefined)
+  const generation = request.generation
+  
+  
+  
+  const breakpoints = Cache.newBreakpoints(ANTHROPIC_BREAKPOINT_CAP)
+  const flattened = ProviderShared.flattenToolRequest(updates.request)
+  const tools = flattened.tools.length === 0 ? undefined : flattened.tools.map((tool) => lowerTool(breakpoints, tool))
+  
+  const toolChoice = tools === undefined || !request.toolChoice ? undefined : yield* lowerToolChoice(request.toolChoice)
+  const systemParts = request.system.filter((part) => part.text.length > 0)
+  const system =
+    systemParts.length === 0
+      ? undefined
+      : systemParts.map((part) => ({
+          type: "text" as const,
+          text: part.text,
+          cache_control: cacheControl(breakpoints, part.cache),
+        }))
+  const messages = yield* lowerMessages(flattened.request, breakpoints)
+  if (breakpoints.dropped > 0) {
+    yield* Effect.logWarning(
+      `Anthropic Messages: dropped ${breakpoints.dropped} cache breakpoint(s); the API allows at most ${ANTHROPIC_BREAKPOINT_CAP} per request.`,
+    )
+  }
+  const output_config =
+    updates.effort === undefined && format === undefined ? undefined : { effort: updates.effort, format }
+  const maxTokens = generation?.maxTokens ?? DEFAULT_MAX_TOKENS
+  const body = {
+    model: request.model.id,
+    system,
+    messages,
+    tools,
+    tool_choice: toolChoice,
+    stream: true as const,
+    max_tokens: maxTokens,
+    temperature: generation?.temperature,
+    top_p: generation?.topP,
+    top_k: generation?.topK,
+    stop_sequences: generation?.stop,
+    thinking: applyThinkingBindingDefault(request.model, fitThinking(options.thinking, maxTokens)),
+    output_config,
+    
+    cache_control: options.cache_control ?? options.cacheControl,
+    container: options.container,
+    inference_geo: options.inference_geo ?? options.inferenceGeo ?? undefined,
+    metadata: options.metadata,
+    service_tier: options.service_tier ?? options.serviceTier,
+  }
+  if (!management) return body
+  return {
+    ...body,
+    context_management: {
+      edits: management.edits.map((edit) => ({
+        type: edit.type,
+        trigger: edit.trigger,
+        pause_after_compaction: edit.pauseAfterCompaction,
+        instructions: edit.instructions,
+      })),
+    },
+  }
+})
+
+
+
+
+const mapFinishReason = (reason: string | null | undefined): FinishReason => {
+  if (reason === "end_turn" || reason === "stop_sequence" || reason === "pause_turn") return "stop"
+  if (reason === "max_tokens" || reason === "model_context_window_exceeded") return "length"
+  if (reason === "tool_use") return "tool-calls"
+  if (reason === "refusal") return "content-filter"
+  return "unknown"
+}
+
+
+
+
+
+
+
+const mapUsage = (usage: AnthropicUsage | undefined, providerMetadataKey: string): Usage | undefined => {
+  if (!usage) return undefined
+  const iterations = usage.iterations?.length ? usage.iterations : [usage]
+  const last = usage.iterations?.at(-1)
+  const nonCached = ProviderShared.sumTokens(...iterations.map((item) => item.input_tokens ?? undefined))
+  const cacheRead = ProviderShared.sumTokens(...iterations.map((item) => item.cache_read_input_tokens ?? undefined))
+  const cacheWrite = ProviderShared.sumTokens(
+    ...iterations.map((item) => item.cache_creation_input_tokens ?? undefined),
+  )
+  const inputTokens = ProviderShared.sumTokens(nonCached, cacheRead, cacheWrite)
+  const outputTokens = ProviderShared.sumTokens(...iterations.map((item) => item.output_tokens))
+  return new Usage({
+    inputTokens,
+    outputTokens,
+    contextTokens:
+      last?.type === "message"
+        ? ProviderShared.sumTokens(
+            last.input_tokens ?? undefined,
+            last.cache_read_input_tokens ?? undefined,
+            last.cache_creation_input_tokens ?? undefined,
+          )
+        : undefined,
+    nonCachedInputTokens: nonCached,
+    cacheReadInputTokens: cacheRead,
+    cacheWriteInputTokens: cacheWrite,
+    reasoningTokens: ProviderShared.sumTokens(...iterations.map((item) => item.output_tokens_details?.thinking_tokens)),
+    totalTokens: ProviderShared.totalTokens(inputTokens, outputTokens, undefined),
+    providerMetadata: { [providerMetadataKey]: usage },
+  })
+}
+
+
+
+
+
+
+const mergeUsage = (left: Usage | undefined, right: Usage | undefined, providerMetadataKey: string) => {
+  if (!left) return right
+  if (!right) return left
+  const nonCachedInputTokens = right.nonCachedInputTokens ?? left.nonCachedInputTokens
+  const cacheReadInputTokens = right.cacheReadInputTokens ?? left.cacheReadInputTokens
+  const cacheWriteInputTokens = right.cacheWriteInputTokens ?? left.cacheWriteInputTokens
+  const inputTokens = ProviderShared.sumTokens(nonCachedInputTokens, cacheReadInputTokens, cacheWriteInputTokens)
+  const outputTokens = right.outputTokens ?? left.outputTokens
+  const reasoningTokens = right.reasoningTokens ?? left.reasoningTokens
+  return new Usage({
+    inputTokens,
+    outputTokens,
+    contextTokens: right.contextTokens ?? left.contextTokens,
+    nonCachedInputTokens,
+    cacheReadInputTokens,
+    cacheWriteInputTokens,
+    reasoningTokens,
+    totalTokens: ProviderShared.totalTokens(inputTokens, outputTokens, undefined),
+    providerMetadata: {
+      [providerMetadataKey]:
+        mergeJsonRecords(left.providerMetadata?.[providerMetadataKey], right.providerMetadata?.[providerMetadataKey]) ??
+        {},
+    },
+  })
+}
+
+
+
+
+
+
+const SERVER_TOOL_RESULT_NAMES: Record<AnthropicServerToolResultType, string> = {
+  web_search_tool_result: "web_search",
+  code_execution_tool_result: "code_execution",
+  web_fetch_tool_result: "web_fetch",
+}
+
+const isServerToolResultType = (type: string): type is AnthropicServerToolResultType => type in SERVER_TOOL_RESULT_NAMES
+
+const serverToolResultEvent = (block: AnthropicStreamBlock, providerMetadataKey: string): LLMEvent | undefined => {
+  if (!block.type || !isServerToolResultType(block.type)) return undefined
+  const errorPayload =
+    typeof block.content === "object" && block.content !== null && "type" in block.content
+      ? String((block.content as Record<string, unknown>).type)
+      : ""
+  const isError = errorPayload.endsWith("_tool_result_error")
+  return LLMEvent.toolResult({
+    id: block.tool_use_id ?? "",
+    name: SERVER_TOOL_RESULT_NAMES[block.type],
+    result: isError ? { type: "error", value: block.content } : { type: "json", value: block.content },
+    providerExecuted: true,
+    
+    
+    providerMetadata: providerMetadata(providerMetadataKey, { blockType: block.type, result: block.content }),
+  })
+}
+
+type StepResult = readonly [ParserState, ReadonlyArray<LLMEvent>]
+
+const NO_EVENTS: StepResult["1"] = []
+
+const onMessageStart = (state: ParserState, event: AnthropicEvent): StepResult => {
+  const usage = mapUsage(event.message?.usage, state.providerMetadataKey)
+  return [usage ? { ...state, usage: mergeUsage(state.usage, usage, state.providerMetadataKey) } : state, NO_EVENTS]
+}
+
+const onContentBlockStart = (
+  state: ParserState,
+  event: AnthropicEvent & { readonly content_block: AnthropicStreamBlock },
+): StepResult => {
+  const block = event.content_block
+
+  if (block.type === "tool_use" || block.type === "server_tool_use") {
+    if (event.index === undefined || !block.id) return [state, NO_EVENTS]
+    const events: LLMEvent[] = []
+    const lifecycle = Lifecycle.stepStart(state.lifecycle, events)
+    return [
+      {
+        ...state,
+        lifecycle,
+        tools: ToolStream.start(state.tools, event.index, {
+          id: block.id,
+          name: block.name ?? "",
+          input:
+            block.input !== undefined && (!ProviderShared.isRecord(block.input) || Object.keys(block.input).length > 0)
+              ? ProviderShared.encodeJson(block.input)
+              : undefined,
+          providerExecuted: block.type === "server_tool_use",
+        }),
+      },
+      [
+        ...events,
+        LLMEvent.toolInputStart({
+          id: block.id,
+          name: block.name ?? "",
+          providerExecuted: block.type === "server_tool_use" ? true : undefined,
+        }),
+      ],
+    ]
+  }
+
+  if (block.type === "text" && block.text !== undefined) {
+    const events: LLMEvent[] = []
+    const id = `text-${event.index ?? 0}`
+    const lifecycle = Lifecycle.textStart(state.lifecycle, events, id)
+    return [
+      { ...state, lifecycle: block.text ? Lifecycle.textDelta(lifecycle, events, id, block.text) : lifecycle },
+      events,
+    ]
+  }
+
+  if (block.type === "thinking" && block.thinking !== undefined) {
+    const events: LLMEvent[] = []
+    const id = `reasoning-${event.index ?? 0}`
+    const metadata =
+      block.signature === undefined
+        ? undefined
+        : providerMetadata(state.providerMetadataKey, { signature: block.signature })
+    const lifecycle = Lifecycle.reasoningStart(state.lifecycle, events, id, metadata)
+    return [
+      {
+        ...state,
+        lifecycle: block.thinking
+          ? Lifecycle.reasoningDelta(lifecycle, events, id, block.thinking, metadata)
+          : lifecycle,
+        reasoningSignatures:
+          event.index === undefined || block.signature === undefined
+            ? state.reasoningSignatures
+            : { ...state.reasoningSignatures, [event.index]: block.signature },
+      },
+      events,
+    ]
+  }
+
+  
+  
+  
+  if (block.type === "redacted_thinking" && block.data !== undefined) {
+    const events: LLMEvent[] = []
+    return [
+      {
+        ...state,
+        lifecycle: Lifecycle.reasoningStart(
+          state.lifecycle,
+          events,
+          `reasoning-${event.index ?? 0}`,
+          providerMetadata(state.providerMetadataKey, { redactedData: block.data }),
+        ),
+      },
+      events,
+    ]
+  }
+
+  const result = serverToolResultEvent(block, state.providerMetadataKey)
+  if (!result) return [state, NO_EVENTS]
+  const events: LLMEvent[] = []
+  return [{ ...state, lifecycle: Lifecycle.stepStart(state.lifecycle, events) }, [...events, result]]
+}
+
+const onContentBlockDelta = Effect.fnUntraced(function* (
+  state: ParserState,
+  event: AnthropicEvent & { readonly delta: AnthropicStreamDelta },
+) {
+  const delta = event.delta
+
+  if (delta.type === "compaction_delta") {
+    if (event.index === undefined || !(event.index in state.compactions) || delta.content === undefined)
+      return yield* ProviderShared.eventError(ADAPTER, "Compaction delta is missing its block or content")
+    return [
+      { ...state, compactions: { ...state.compactions, [event.index]: delta.content } },
+      NO_EVENTS,
+    ] satisfies StepResult
+  }
+
+  if (delta.type === "text_delta" && delta.text) {
+    if (!state.lifecycle.text.has(`text-${event.index ?? 0}`)) return [state, NO_EVENTS] satisfies StepResult
+    const events: LLMEvent[] = []
+    return [
+      { ...state, lifecycle: Lifecycle.textDelta(state.lifecycle, events, `text-${event.index ?? 0}`, delta.text) },
+      events,
+    ] satisfies StepResult
+  }
+
+  if (delta.type === "thinking_delta" && delta.thinking) {
+    if (!state.lifecycle.reasoning.has(`reasoning-${event.index ?? 0}`)) return [state, NO_EVENTS] satisfies StepResult
+    const events: LLMEvent[] = []
+    return [
+      {
+        ...state,
+        lifecycle: Lifecycle.reasoningDelta(state.lifecycle, events, `reasoning-${event.index ?? 0}`, delta.thinking),
+      },
+      events,
+    ] satisfies StepResult
+  }
+
+  if (delta.type === "signature_delta" && delta.signature) {
+    const index = event.index ?? 0
+    if (!state.lifecycle.reasoning.has(`reasoning-${index}`)) return [state, NO_EVENTS] satisfies StepResult
+    return [
+      {
+        ...state,
+        reasoningSignatures: { ...state.reasoningSignatures, [index]: delta.signature },
+      },
+      NO_EVENTS,
+    ] satisfies StepResult
+  }
+
+  if (delta.type === "input_json_delta" && event.index !== undefined) {
+    if (!delta.partial_json) return [state, NO_EVENTS] satisfies StepResult
+    if (!state.tools[event.index]) return [state, NO_EVENTS] satisfies StepResult
+    const result = ToolStream.appendExisting(
+      ADAPTER,
+      state.tools,
+      event.index,
+      delta.partial_json,
+      "Anthropic Messages tool argument delta is missing its tool call",
+    )
+    if (ToolStream.isError(result)) return yield* result
+    const events: LLMEvent[] = []
+    const lifecycle = result.events.length ? Lifecycle.stepStart(state.lifecycle, events) : state.lifecycle
+    events.push(...result.events)
+    return [{ ...state, lifecycle, tools: result.tools }, events] satisfies StepResult
+  }
+
+  return [state, NO_EVENTS] satisfies StepResult
+})
+
+const onContentBlockStop = Effect.fnUntraced(function* (
+  state: ParserState,
+  event: AnthropicEvent,
+) {
+  if (event.index === undefined) return [state, NO_EVENTS] satisfies StepResult
+  if (event.index in state.compactions) {
+    const { [event.index]: content, ...compactions } = state.compactions
+    const events: LLMEvent[] = []
+    const lifecycle = Lifecycle.stepStart(state.lifecycle, events)
+    events.push(
+      LLMEvent.compaction({
+        provider: state.provider,
+        text: content,
+      }),
+    )
+    return [{ ...state, compactions, lifecycle }, events] satisfies StepResult
+  }
+  const result = yield* ToolStream.finish(ADAPTER, state.tools, event.index)
+  const events: LLMEvent[] = []
+  const resultEvents = result.events ?? []
+  const signature = state.reasoningSignatures[event.index]
+  const lifecycle = resultEvents.length
+    ? Lifecycle.stepStart(state.lifecycle, events)
+    : Lifecycle.reasoningEnd(
+        Lifecycle.textEnd(state.lifecycle, events, `text-${event.index}`),
+        events,
+        `reasoning-${event.index}`,
+        signature === undefined ? undefined : providerMetadata(state.providerMetadataKey, { signature }),
+      )
+  events.push(...resultEvents)
+  const reasoningSignatures = { ...state.reasoningSignatures }
+  delete reasoningSignatures[event.index]
+  return [{ ...state, lifecycle, tools: result.tools, reasoningSignatures }, events] satisfies StepResult
+})
+
+const onMessageDelta = (
+  state: ParserState,
+  event: AnthropicEvent & { readonly delta?: AnthropicStreamDelta },
+): StepResult => {
+  const usage = mergeUsage(state.usage, mapUsage(event.usage, state.providerMetadataKey), state.providerMetadataKey)
+  const pendingFinish = (() => {
+    const stopReason = event.delta?.stop_reason
+    if (stopReason === null || stopReason === undefined) return state.pendingFinish
+
+    const stopSequence = event.delta?.stop_sequence
+    const finishMetadata =
+      stopSequence === null || stopSequence === undefined
+        ? state.pendingFinish?.providerMetadata
+        : providerMetadata(state.providerMetadataKey, { stopSequence })
+    const category = event.delta?.stop_details?.category
+    const explanation = event.delta?.stop_details?.explanation
+    return {
+      reason: {
+        normalized: mapFinishReason(stopReason),
+        raw: stopReason,
+        ...(category ? { category } : {}),
+        ...(explanation ? { explanation } : {}),
+      },
+      providerMetadata: finishMetadata,
+    }
+  })()
+  return [
+    {
+      ...state,
+      usage,
+      pendingFinish,
+    },
+    NO_EVENTS,
+  ]
+}
+
+const onMessageStop = Effect.fnUntraced(function* (state: ParserState) {
+  if (Object.keys(state.compactions).length)
+    return yield* ProviderShared.eventError(ADAPTER, "Response ended with an incomplete compaction block")
+  const result = yield* ToolStream.finishAll(ADAPTER, state.tools)
+  const events: LLMEvent[] = []
+  const lifecycle = result.events.length ? Lifecycle.stepStart(state.lifecycle, events) : state.lifecycle
+  events.push(...result.events)
+  const closed = Object.entries(state.reasoningSignatures).reduce(
+    (current, [index, signature]) =>
+      Lifecycle.reasoningEnd(
+        current,
+        events,
+        `reasoning-${index}`,
+        providerMetadata(state.providerMetadataKey, { signature }),
+      ),
+    lifecycle,
+  )
+  const finished = Lifecycle.finish(closed, events, {
+    reason: state.pendingFinish?.reason ?? {
+      normalized: "unknown",
+      raw: undefined,
+    },
+    usage: state.usage,
+    providerMetadata: state.pendingFinish?.providerMetadata,
+  })
+  return [{ ...state, lifecycle: finished, tools: result.tools }, events] satisfies StepResult
+})
+
+
+
+const providerErrorMessage = (event: AnthropicEvent): string => {
+  const type = event.error?.type
+  const message = event.error?.message
+  if (type && message) return `${type}: ${message}`
+  return message || type || "Anthropic Messages stream error"
+}
+
+const onError = (event: AnthropicEvent) => {
+  const message = providerErrorMessage(event)
+  const body = ProviderShared.encodeJson(event)
+  return Effect.fail(
+    new AIError({
+      reason: classifyProviderFailure({ message, rawBody: body }),
+    }),
+  )
+}
+
+const STREAM_BLOCK_TYPES = new Set([
+  "compaction",
+  "text",
+  "thinking",
+  "redacted_thinking",
+  "tool_use",
+  "server_tool_use",
+])
+const STREAM_DELTA_TYPES = new Set([
+  "compaction_delta",
+  "text_delta",
+  "thinking_delta",
+  "signature_delta",
+  "input_json_delta",
+])
+
+const invalidStreamEvent = (event: AnthropicEvent) =>
+  Effect.fail(
+    ProviderShared.eventError(
+      ADAPTER,
+      "Invalid anthropic/anthropic-messages stream event",
+      ProviderShared.encodeJson(event),
+    ),
+  )
+
+const step = (state: ParserState, event: AnthropicEvent) => {
+  if (!SSE_EVENTS.has(event.type)) return Effect.succeed<StepResult>([state, NO_EVENTS])
+  if (
+    event.type !== "content_block_start" &&
+    event.content_block !== undefined &&
+    Option.isNone(decodeAnthropicStreamBlock(event.content_block))
+  )
+    return invalidStreamEvent(event)
+  if (
+    event.type !== "content_block_delta" &&
+    event.delta !== undefined &&
+    Option.isNone(decodeAnthropicStreamDelta(event.delta))
+  )
+    return invalidStreamEvent(event)
+  if (event.type === "message_start") return Effect.succeed(onMessageStart(state, event))
+  if (event.type === "content_block_start") {
+    if (!ProviderShared.isRecord(event.content_block) || typeof event.content_block.type !== "string")
+      return invalidStreamEvent(event)
+    if (event.content_block.type === "compaction") {
+      const decoded = Schema.decodeUnknownOption(AnthropicCompactionBlock)(event.content_block)
+      if (event.index === undefined || Option.isNone(decoded)) return invalidStreamEvent(event)
+      return Effect.succeed<StepResult>([
+        { ...state, compactions: { ...state.compactions, [event.index]: decoded.value.content } },
+        NO_EVENTS,
+      ])
+    }
+    if (!STREAM_BLOCK_TYPES.has(event.content_block.type) && !isServerToolResultType(event.content_block.type))
+      return Effect.succeed<StepResult>([state, NO_EVENTS])
+    const decoded = decodeAnthropicStreamBlock(event.content_block)
+    if (Option.isNone(decoded)) return invalidStreamEvent(event)
+    const block = decoded.value
+    if (block.type === "tool_use" || block.type === "server_tool_use") {
+      if (event.index === undefined)
+        return Effect.fail(ProviderShared.eventError(ADAPTER, `Anthropic ${block.type} missing index`))
+      if (!block.id)
+        return Effect.fail(ProviderShared.eventError(ADAPTER, `Anthropic tool_use missing id at index ${event.index}`))
+    }
+    return Effect.succeed(onContentBlockStart(state, { ...event, content_block: block }))
+  }
+  if (event.type === "content_block_delta") {
+    if (!ProviderShared.isRecord(event.delta)) return invalidStreamEvent(event)
+    if (typeof event.delta.type === "string" && !STREAM_DELTA_TYPES.has(event.delta.type))
+      return Effect.succeed<StepResult>([state, NO_EVENTS])
+    const decoded = decodeAnthropicStreamDelta(event.delta)
+    if (Option.isNone(decoded)) return invalidStreamEvent(event)
+    return onContentBlockDelta(state, { ...event, delta: decoded.value })
+  }
+  if (event.type === "content_block_stop") return onContentBlockStop(state, event)
+  if (event.type === "message_delta") {
+    const decoded = decodeAnthropicStreamDelta(event.delta)
+    if (Option.isNone(decoded)) return invalidStreamEvent(event)
+    return Effect.succeed(onMessageDelta(state, { ...event, delta: decoded.value }))
+  }
+  if (event.type === "message_stop") return onMessageStop(state)
+  if (event.type === "error") return onError(event)
+  return Effect.succeed<StepResult>([state, NO_EVENTS])
+}
+
+
+
+
+
+export const protocol = Protocol.make({
+  id: ADAPTER,
+  body: {
+    schema: AnthropicMessagesBody,
+    from: fromRequest,
+  },
+  stream: {
+    event: Protocol.jsonEvent(AnthropicEvent),
+    initial: (request) => ({
+      provider: request.model.provider,
+      compactions: {},
+      providerMetadataKey: request.model.route.providerMetadataKey ?? String(request.model.provider),
+      tools: ToolStream.empty<number>(),
+      reasoningSignatures: {},
+      lifecycle: Lifecycle.initial(),
+    }),
+    step,
+  },
+  supportsEffortUpdates,
+})
+
+export const transport = <
+  Body extends Pick<AnthropicMessagesBody, "messages" | "context_management" | "thinking">,
+>() => {
+  const http = HttpTransport.httpJson<Body, string>({ framing })
+  return {
+    ...http,
+    prepare: (input: Parameters<typeof http.prepare>[0]) => {
+      const requiredBetas = requiredBetaHeaders(input.body)
+      if (requiredBetas.length === 0) return http.prepare(input)
+      const headers = Headers.fromInput(input.request.http?.headers)
+      const existingBetas = (headers["anthropic-beta"] ?? "")
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean)
+      const betas = new Set([...existingBetas, ...requiredBetas])
+      return http.prepare({
+        ...input,
+        request: LLMRequest.update(input.request, {
+          http: new HttpOptions({
+            ...input.request.http,
+            headers: { ...headers, "anthropic-beta": [...betas].join(",") },
+          }),
+        }),
+      })
+    },
+  }
+}
+
+function requiredBetaHeaders(body: Pick<AnthropicMessagesBody, "messages" | "context_management" | "thinking">) {
+  
+  
+  
+  const betas: string[] = ["interleaved-thinking-2025-05-14"]
+  const requestsCompaction = (body.context_management?.edits.length ?? 0) > 0
+  const replaysCompaction = body.messages.some((message) =>
+    message.content.some((block) => block.type === "compaction"),
+  )
+  if (requestsCompaction || replaysCompaction) betas.push("compact-2026-01-12")
+
+  if (body.messages.some((message) => message.role === "system" && message.output_config !== undefined))
+    betas.push("mid-conversation-output-config-2026-07-01")
+
+  const thinking = body.thinking
+  if (thinking && !isThinkingOff(thinking) && thinking.block_binding) betas.push(THINKING_BINDING_BETA)
+  return betas
+}
+
+export const route = Route.make({
+  id: ADAPTER,
+  provider: "anthropic",
+  providerMetadataKey: "anthropic",
+  protocol,
+  endpoint: Endpoint.path((input) => (input.request.model.provider === "anthropic" ? `${PATH}?beta=true` : PATH), {
+    baseURL: DEFAULT_BASE_URL,
+  }),
+  auth: Auth.none,
+  transport: transport<AnthropicMessagesBody>(),
+  headers: () => ({ "anthropic-version": "2023-06-01" }),
+})
+
+export * as AnthropicMessages from "./anthropic-messages.js"

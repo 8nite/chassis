@@ -1,0 +1,85 @@
+import type { LanguageModelV3 } from "@ai-sdk/provider"
+import { type FetchFunction, withoutTrailingSlash, withUserAgentSuffix } from "@ai-sdk/provider-utils"
+import { OpenAICompatibleChatLanguageModel } from "./chat/openai-compatible-chat-language-model.js"
+import { OpenAIResponsesLanguageModel } from "./responses/openai-responses-language-model.js"
+
+
+const VERSION = "0.1.0"
+
+export type OpenaiCompatibleModelId = string
+
+export interface OpenaiCompatibleProviderSettings {
+  
+  apiKey?: string
+
+  
+  baseURL?: string
+
+  
+  name?: string
+
+  
+  headers?: Record<string, string>
+
+  
+  fetch?: FetchFunction
+}
+
+export interface OpenaiCompatibleProvider {
+  (modelId: OpenaiCompatibleModelId): LanguageModelV3
+  chat(modelId: OpenaiCompatibleModelId): LanguageModelV3
+  responses(modelId: OpenaiCompatibleModelId): LanguageModelV3
+  languageModel(modelId: OpenaiCompatibleModelId): LanguageModelV3
+
+  
+
+  
+}
+
+
+export function createOpenaiCompatible(options: OpenaiCompatibleProviderSettings = {}): OpenaiCompatibleProvider {
+  const baseURL = withoutTrailingSlash(options.baseURL ?? "https://api.openai.com/v1")
+
+  if (!baseURL) {
+    throw new Error("baseURL is required")
+  }
+
+  
+  const headers = {
+    
+    ...(options.apiKey && { Authorization: `Bearer ${options.apiKey}` }),
+    ...options.headers,
+  }
+
+  const getHeaders = () => withUserAgentSuffix(headers, `ai-sdk/openai-compatible/${VERSION}`)
+
+  const createChatModel = (modelId: OpenaiCompatibleModelId) => {
+    return new OpenAICompatibleChatLanguageModel(modelId, {
+      provider: `${options.name ?? "openai-compatible"}.chat`,
+      headers: getHeaders,
+      url: ({ path }) => `${baseURL}${path}`,
+      fetch: options.fetch,
+    })
+  }
+
+  const createResponsesModel = (modelId: OpenaiCompatibleModelId) => {
+    return new OpenAIResponsesLanguageModel(modelId, {
+      provider: `${options.name ?? "openai-compatible"}.responses`,
+      headers: getHeaders,
+      url: ({ path }) => `${baseURL}${path}`,
+      fetch: options.fetch,
+    })
+  }
+
+  const createLanguageModel = (modelId: OpenaiCompatibleModelId) => createChatModel(modelId)
+
+  const provider = function (modelId: OpenaiCompatibleModelId) {
+    return createChatModel(modelId)
+  }
+
+  provider.languageModel = createLanguageModel
+  provider.chat = createChatModel
+  provider.responses = createResponsesModel
+
+  return provider as OpenaiCompatibleProvider
+}

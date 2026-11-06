@@ -1,0 +1,88 @@
+{
+  "$schema": "https://v2-8-13.turborepo.dev/schema.json",
+  "globalDependencies": [
+    "patches/**",
+    "bunfig.toml",
+    ".npmrc",
+    ".github/actions/setup-bun/**",
+    ".github/workflows/test.yml"
+  ],
+  "globalEnv": ["CI", "CHASSIS_DISABLE_SHARE"],
+  "globalPassThroughEnv": ["CI", "CHASSIS_DISABLE_SHARE"],
+  "tasks": {
+    "typecheck": {},
+    "@chassis/cli#typecheck": {
+      "dependsOn": ["@chassis/core#typecheck"]
+    },
+    "test:components": {
+      "outputs": [],
+      "cache": false
+    },
+    "@chassis/sdk#typecheck": {
+      "dependsOn": ["@chassis/core#typecheck"]
+    },
+    "@chassis/server#typecheck": {
+      "dependsOn": ["@chassis/core#typecheck"]
+    },
+    "@chassis/simulation#typecheck": {
+      "dependsOn": ["@chassis/core#typecheck"]
+    },
+    "@chassis/tui#typecheck": {
+      "dependsOn": ["@chassis/core#typecheck"]
+    },
+    "build": {
+      "dependsOn": [],
+      "outputs": ["dist/**"]
+    },
+    "@chassis/ai#test": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "@chassis/codemode#test": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "@chassis/core#test": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "@chassis/desktop#test": {
+      "outputs": [],
+      "cache": false
+    },
+    "@chassis/httpapi-codegen#test": {
+      "outputs": []
+    },
+    "@chassis/server#test": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "@chassis/cli#test": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "@chassis/tui#test": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "@chassis/latex#test": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "@chassis/app#test": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "@chassis/ui#test": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "@chassis/session-ui#test": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "@chassis/sdk#verify:package": {
+      "outputs": []
+    }
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "version": "2.0.26",
+  "name": "@chassis/sdk",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/8nite/chassis.git",
+    "directory": "packages/sdk"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": "./src/index.ts",
+    "./effect": "./src/effect/index.ts",
+    "./workerd": "./src/workerd.ts",
+    "./workerd/effect": "./src/effect/workerd.ts"
+  },
+  "scripts": {
+    "build": "bun run script/build.ts",
+    "test": "bun test --timeout 5000",
+    "typecheck": "tsgo -b",
+    "verify:package": "bun run script/verify-package.ts"
+  },
+  "dependencies": {
+    "@chassis/client": "workspace:*",
+    "@chassis/core": "workspace:*",
+    "@chassis/plugin": "workspace:*",
+    "@chassis/schema": "workspace:*",
+    "@chassis/server": "workspace:*",
+    "@chassis/util": "workspace:*",
+    "effect": "catalog:"
+  },
+  "devDependencies": {
+    "@chassis/ai": "workspace:*",
+    "@chassis/httpapi-codegen": "workspace:*",
+    "@chassis/protocol": "workspace:*",
+    "@tsconfig/bun": "catalog:",
+    "@types/bun": "catalog:",
+    "@typescript/native-preview": "catalog:"
+  }
+}

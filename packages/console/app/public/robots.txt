@@ -1,0 +1,9 @@
+User-agent: *
+Allow: /
+
+# Disallow shared content pages
+Disallow: /s/
+Disallow: /share/
+
+Sitemap: https:///sitemap.xml
+Sitemap: https:///data/sitemap.xml

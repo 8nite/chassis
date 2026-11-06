@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Chassis
+Exec=/opt/Chassis/ai.chassis.desktop %U
+Terminal=false
+Type=Application
+Icon=ai.chassis.desktop
+StartupWMClass=ai.chassis.desktop
+NoDisplay=true
+Comment=Open source AI coding agent
+Categories=Development;

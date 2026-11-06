@@ -1,0 +1,29 @@
+{
+  "name": "@chassis/pty-linux-x64-musl",
+  "version": "0.3.1",
+  "description": "Chassis persistent PTY service for linux-x64-musl",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anomalyco/chassis-pty.git"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "musl"
+  ],
+  "exports": {
+    "./package.json": "./package.json",
+    "./bin/chassis-pty": "./bin/chassis-pty"
+  },
+  "files": [
+    "bin"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -1,0 +1,55 @@
+---
+title: "Intro"
+---
+
+Chassis is an open source AI coding agent. It’s available as a terminal-based interface, desktop app, or web app.
+
+
+## CLI
+
+<CodeTabs
+  id="install"
+  label="Install method"
+  tabs={[
+    { label: "source", code: "git clone https://github.com/8nite/chassis.git && cd chassis && bun install" },
+  ]}
+/>
+
+Clone the repository and build from source ([full steps](https://github.com/8nite/chassis#install-from-source)).
+You need [Bun](https://bun.sh) installed.
+
+
+## Web
+
+Access the Chassis web interface with the `chassis pair` command.
+
+```bash
+$ chassis pair
+
+  URLs      http://127.0.0.1:49374
+  Username  chassis
+  Password  ********
+```
+
+---
+
+## Connect
+
+Chassis has built in support for many LLM providers - you can connect to them
+directly [in the TUI](/cli/providers) with `/connect`.
+
+See [Providers](/providers) to configure custom providers.
+
+If you'd like easy access to all the best coding models you can try out
+[Chassis Console](/console).
+
+You can also try [Chassis Go](/console/go) a $10/month subscription
+plan that grants you access to the best open source models.
+
+---
+
+## Customize
+
+Make Chassis your own by editing the [Chassis config](/config), [loading plugins](/plugins), [connecting MCP
+servers](/mcp-servers), or [creating commands](/commands). For terminal interface themes and keybindings, see [CLI
+settings](/cli/config).

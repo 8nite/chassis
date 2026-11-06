@@ -1,0 +1,39 @@
+{
+  "name": "@chassis/pty",
+  "version": "0.3.1",
+  "description": "Persistent PTY service for Chassis",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anomalyco/chassis-pty.git"
+  },
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "chassis-pty": "./bin/chassis-pty.js"
+  },
+  "files": [
+    "bin",
+    "index.d.ts",
+    "index.js"
+  ],
+  "optionalDependencies": {
+    "@chassis/pty-darwin-arm64": "0.3.1",
+    "@chassis/pty-darwin-x64": "0.3.1",
+    "@chassis/pty-linux-arm64-gnu": "0.3.1",
+    "@chassis/pty-linux-arm64-musl": "0.3.1",
+    "@chassis/pty-linux-x64-gnu": "0.3.1",
+    "@chassis/pty-linux-x64-musl": "0.3.1",
+    "@chassis/pty-win32-arm64": "0.3.1",
+    "@chassis/pty-win32-x64": "0.3.1"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

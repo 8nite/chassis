@@ -1,0 +1,2 @@
+ALTER TABLE `account` ADD PRIMARY KEY(`id`);
+ALTER TABLE `auth` ADD PRIMARY KEY(`id`);

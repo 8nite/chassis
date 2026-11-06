@@ -1,0 +1,188 @@
+---
+title: "Troubleshooting"
+---
+
+<Callout type="tip">
+  You can ask Chassis to debug itself. Describe the problem and ask it to use this troubleshooting page; it can read
+  the steps below, inspect its service and logs, and help identify the issue.
+</Callout>
+
+Chassis uses a client-server architecture. A background server owns sessions, plugins, permissions, and other application
+state. Start by determining whether an issue is in a client, the shared server, or a specific project.
+
+## Check the background service
+
+Show the current server information:
+
+```bash
+chassis service status
+```
+
+Verify that its API is healthy:
+
+```bash
+chassis api get /api/info
+```
+
+If the service is stuck or unhealthy, restart it:
+
+```bash
+chassis service restart
+```
+
+You can also stop and start it explicitly:
+
+```bash
+chassis service stop
+chassis service start
+```
+
+<Callout type="note">
+  Chassis normally discovers or starts the shared background service automatically. The service commands are only
+  needed when diagnosing its lifecycle.
+</Callout>
+
+## Allow a browser origin
+
+If a browser client on another origin cannot connect because of CORS, add the client's origin to the service configuration:
+
+```bash
+chassis service set cors http://192.168.1.10:3001
+chassis service get cors
+```
+
+Use an exact HTTP or HTTPS origin, including the port when needed, without a path or trailing slash. To allow multiple
+origins, pass a comma-separated list as one argument; whitespace around each origin is trimmed:
+
+```bash
+chassis service set cors "http://192.168.1.10:3001, https://app.example.com"
+```
+
+`service get cors` prints a JSON array. Remove the configured list with:
+
+```bash
+chassis service unset cors
+```
+
+Setting or unsetting service configuration stops the background service. Its next start picks up the new configuration;
+use `chassis service start` to start it explicitly.
+
+For a foreground server, repeat `--cors` for each additional allowed origin:
+
+```bash
+chassis serve --cors http://192.168.1.10:3001 --cors https://app.example.com
+```
+
+With `serve --service`, supplied `--cors` flags override the persisted list for that process. Without those flags, service
+mode uses the persisted list. CORS does not change the listening address or bypass server authentication.
+
+## Inspect the API
+
+The `api` command uses the local service discovery and authentication flow. It accepts either an HTTP method and path or an
+OpenAPI operation ID.
+
+See the [API reference](/api) for all endpoints and operation IDs.
+
+Pass a JSON request body with `--data` or `-d`, and add headers with `--header` or `-H`.
+
+<Callout type="warning">
+  Running `chassis api` may start the background service when no compatible healthy service is available.
+</Callout>
+
+## Read logs
+
+Installed builds write logs to:
+
+```text
+~/.local/share/chassis/log/chassis.log
+```
+
+Follow the log while reproducing the problem:
+
+```bash
+tail -f ~/.local/share/chassis/log/chassis.log
+```
+
+Each line includes a process `run` ID and a `role` field. Use `role=server` for session, provider, plugin, permission, and
+tool activity.
+
+```bash
+grep 'role=server' ~/.local/share/chassis/log/chassis.log
+grep 'run=8fc3b1d5' ~/.local/share/chassis/log/chassis.log
+```
+
+## Capture CPU and memory profiles
+
+On macOS and Linux, you can signal a running Chassis process to capture diagnostic data. Get the background server PID
+from the health endpoint:
+
+```bash
+chassis api get /api/info
+```
+
+Use the `pid` from the response with one of these signals:
+
+- `SIGPROF` captures a ten-second CPU profile:
+
+  ```bash
+  kill -SIGPROF <pid>
+  ```
+
+  The result is written to the log directory as `cpu-<pid>-<timestamp>.cpuprofile`.
+
+- `SIGUSR1` captures a memory (heap) snapshot:
+
+  ```bash
+  kill -SIGUSR1 <pid>
+  ```
+
+  The result is written to the log directory as `heap-<pid>-<timestamp>.heapsnapshot`.
+
+Wait for `CPU profile written` or `heap snapshot written` in `chassis.log` before opening the file. The corresponding
+log entry includes its complete path. You can inspect both file types in Chrome DevTools.
+
+<Callout type="note">
+  Signal-triggered profiles are not available on Windows. Writing a heap snapshot can pause the process and temporarily
+  increase its memory usage.
+</Callout>
+
+## Service files
+
+The shared server registers itself at:
+
+```text
+~/.local/state/chassis/service.json
+```
+
+Its private service configuration is stored separately at:
+
+```text
+~/.config/chassis/service.json
+```
+
+The database normally lives at:
+
+```text
+~/.local/share/chassis/chassis.db
+```
+
+`CHASSIS_DB` can override the database location.
+
+<Callout type="warning">
+  Do not delete or edit service files or the database while troubleshooting. Use the service commands to manage the
+  daemon, and make a backup before inspecting persistent data with external tools.
+</Callout>
+
+## Report an issue
+
+Include the following when reporting a reproducible problem:
+
+- Output from `chassis --version`
+- Output from `chassis service status`
+- The smallest sequence of steps that reproduces the issue
+- Whether the issue affects the shared service, a specific client, or one project
+- Relevant log lines, including their `run` and `role` fields
+
+Remove API keys, authorization headers, prompts, file contents, and other sensitive data before sharing logs.
+
+File reproducible problems in [GitHub Issues](https://github.com/8nite/chassis/issues).
