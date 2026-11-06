@@ -30,10 +30,26 @@ export async function resolveChassisPty(target: Target): Promise<ChassisPtyAsset
   const local = process.env.CHASSIS_PTY_BIN
   if (local && (target.platform !== process.platform || target.arch !== process.arch))
     throw new Error("CHASSIS_PTY_BIN can only be embedded in a build for the current platform and architecture")
-  const source = local ? path.resolve(local) : pty.resolve(`${name}/bin/chassis-pty`)
-  const manifest: unknown = local
-    ? { version: "local" }
-    : JSON.parse(await readFile(pty.resolve(`${name}/package.json`), "utf8"))
+  if (local) {
+    const source = path.resolve(local)
+    return {
+      source,
+      version: "local",
+      sha256: createHash("sha256")
+        .update(await readFile(source))
+        .digest("hex"),
+    }
+  }
+  let manifestPath: string
+  let source: string
+  try {
+    manifestPath = pty.resolve(`${name}/package.json`)
+    source = pty.resolve(`${name}/bin/chassis-pty`)
+  } catch {
+    // ponytail: platform package not vendored/published (e.g. darwin-arm64); build without embedded pty, runtime falls back to CHASSIS_PTY_BIN/PATH.
+    return undefined
+  }
+  const manifest: unknown = JSON.parse(await readFile(manifestPath, "utf8"))
   if (!manifest || typeof manifest !== "object" || !("version" in manifest) || typeof manifest.version !== "string")
     throw new Error(`Invalid package metadata for ${name}`)
 

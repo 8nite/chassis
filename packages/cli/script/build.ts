@@ -63,19 +63,9 @@ const targets =
       : allTargets
 if (!targets.length) throw new Error(`Unknown build target: ${requestedTarget}`)
 
-
-
-const ptyDep = pkg.dependencies["@chassis/pty"] as string
-const ptyVersion =
-  ptyDep === "workspace:*"
-    ? (
-        JSON.parse(
-          await Bun.file(path.join(dir, "../../vendor/chassis/pty/package.json")).text(),
-        ) as { version: string }
-      ).version
-    : ptyDep
+// @chassis/pty is vendored (workspace:*), not on npm, so only prefetch cross-platform @opentui/core here.
 if (!skipInstall)
-  await $`bun install --os="*" --cpu="*" @opentui/core@${pkg.dependencies["@opentui/core"]} @chassis/pty@${ptyVersion}`
+  await $`bun install --os="*" --cpu="*" @opentui/core@${pkg.dependencies["@opentui/core"]}`
 const appArchive = path.join(dir, ".cache", "bun-app-archive.bin")
 await Bun.write(appArchive, await buildAppArchive(Script.channel, { skipBuild: skipWebUi }))
 const appAssetsPlugin: BunPlugin = {
